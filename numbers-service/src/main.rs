@@ -1,8 +1,11 @@
+use futures::Stream;
 use prost_types::Timestamp;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -18,18 +21,45 @@ pub mod proto {
     pub(crate) const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("numbers.v1");
 }
 
+type BroadcastSender = tokio::sync::mpsc::Sender<Result<StreamStationReply, Status>>;
+type BroadcastMap = Arc<Mutex<HashMap<i32, Vec<BroadcastSender>>>>;
+
 #[derive(Debug, Clone)]
 struct StoredStation {
     station: Station,
-    rng: Arc<Mutex<SmallRng>>, // Add RNG here
+    rng: Arc<Mutex<SmallRng>>,
+    current_listeners: Arc<Mutex<u32>>,
 }
 
 pub struct NumbersService {
     stations: Arc<Mutex<HashMap<i32, StoredStation>>>,
-    number_broadcasts: Arc<
-        Mutex<HashMap<i32, Vec<tokio::sync::mpsc::Sender<Result<StreamStationReply, Status>>>>>,
-    >,
+    number_broadcasts: BroadcastMap,
     max_stations: usize,
+}
+
+struct NotifyOnDrop {
+    notify: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        if let Some(tx) = self.notify.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+struct TrackedStream<S> {
+    stream: S,
+    _notify: NotifyOnDrop,
+}
+
+impl<S: Stream + Unpin> Stream for TrackedStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.stream).poll_next(cx)
+    }
 }
 
 impl NumbersService {
@@ -109,6 +139,9 @@ impl NumbersService {
 
 #[tonic::async_trait]
 impl Numbers for NumbersService {
+    type StreamStationStream =
+        Pin<Box<dyn Stream<Item = Result<StreamStationReply, Status>> + Send + 'static>>;
+
     async fn list_stations(
         &self,
         _request: Request<ListStationsRequest>,
@@ -120,7 +153,14 @@ impl Numbers for NumbersService {
 
         let stations: Vec<Station> = stations_lock
             .values()
-            .map(|internal| internal.station)
+            .map(|internal| {
+                let mut station = internal.station;
+                // Update the current_listeners field
+                if let Ok(listeners) = internal.current_listeners.lock() {
+                    station.current_listeners = *listeners;
+                }
+                station
+            })
             .collect();
 
         Ok(Response::new(ListStationsReply { stations }))
@@ -132,7 +172,6 @@ impl Numbers for NumbersService {
     ) -> Result<Response<CreateStationReply>, Status> {
         let req = request.into_inner();
 
-        // Check if we've reached the station limit
         let stations_lock = self
             .stations
             .lock()
@@ -152,7 +191,6 @@ impl Numbers for NumbersService {
             rand::random::<u8>() as i32
         };
 
-        // Generate random unique station ID
         let station_id = self.generate_unique_station_id()?;
 
         let now = std::time::SystemTime::now();
@@ -173,11 +211,13 @@ impl Numbers for NumbersService {
         let station = Station {
             station_id,
             created_at: Some(timestamp),
+            current_listeners: 0, // Initialize with 0 listeners
         };
 
         let internal_station = StoredStation {
             station,
             rng: Arc::new(Mutex::new(rng)),
+            current_listeners: Arc::new(Mutex::new(0)), // Initialize the counter
         };
 
         let mut stations_lock = self
@@ -197,18 +237,28 @@ impl Numbers for NumbersService {
     ) -> Result<Response<Self::StreamStationStream>, Status> {
         let station_id = request.into_inner().station_id;
 
-        // Verify station exists
+        // Verify station exists and get the station
         let stations_lock = self
             .stations
             .lock()
             .map_err(|_| Status::internal("Lock error"))?;
-        if !stations_lock.contains_key(&station_id) {
-            return Err(Status::not_found("Station not found"));
+
+        let station = stations_lock
+            .get(&station_id)
+            .ok_or_else(|| Status::not_found("Station not found"))?;
+
+        // Increment listener count
+        if let Ok(mut listeners) = station.current_listeners.lock() {
+            *listeners += 1;
         }
+        let current_listeners = Arc::clone(&station.current_listeners);
         drop(stations_lock);
 
         // Create channel for streaming
         let (tx, rx) = tokio::sync::mpsc::channel(32);
+
+        // Create oneshot channel for cleanup notification
+        let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
 
         // Add to broadcast list
         let mut broadcasts_lock = self
@@ -220,10 +270,36 @@ impl Numbers for NumbersService {
             .or_insert_with(Vec::new)
             .push(tx);
 
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
+        // Create a task that will decrement the counter when the stream ends
+        let broadcasts = Arc::clone(&self.number_broadcasts);
+        tokio::spawn(async move {
+            // Wait for the notification that the stream has ended
+            let _ = notify_rx.await;
 
-    type StreamStationStream = ReceiverStream<Result<StreamStationReply, Status>>;
+            // Decrement listener count
+            if let Ok(mut listeners) = current_listeners.lock() {
+                *listeners = listeners.saturating_sub(1);
+            }
+
+            // Clean up the broadcast sender
+            if let Ok(mut broadcasts) = broadcasts.lock() {
+                if let Some(txs) = broadcasts.get_mut(&station_id) {
+                    txs.retain(|tx| !tx.is_closed());
+                }
+            }
+        });
+
+        // Create stream with drop notification
+        let stream = ReceiverStream::new(rx);
+        let tracked_stream = TrackedStream {
+            stream,
+            _notify: NotifyOnDrop {
+                notify: Some(notify_tx),
+            },
+        };
+
+        Ok(Response::new(Box::pin(tracked_stream)))
+    }
 }
 
 const DEFAULT_MAX_STATIONS: usize = 100;
