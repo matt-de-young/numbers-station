@@ -13,4 +13,4 @@
 - [ ] CD
 - [ ] Actual README
 - [x] Server Reflection
-- [ ] Health Check
+- [x] Health Check

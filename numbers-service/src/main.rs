@@ -222,11 +222,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_v1()
         .unwrap();
 
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<NumbersServer<NumbersService>>()
+        .await;
+
     let addr = "[::1]:50051".parse()?;
     let numbers_service = NumbersService::default();
 
     Server::builder()
         .add_service(reflection_service)
+        .add_service(health_service)
         .add_service(NumbersServer::new(numbers_service))
         .serve(addr)
         .await?;
