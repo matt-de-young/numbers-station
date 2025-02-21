@@ -12,5 +12,5 @@
 - [ ] Deploy
 - [ ] CD
 - [ ] Actual README
-- [ ] Server Reflection
+- [x] Server Reflection
 - [ ] Health Check

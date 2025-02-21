@@ -6,14 +6,16 @@ use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status};
 
-use numbers::numbers_server::{Numbers, NumbersServer};
-use numbers::{
+use proto::numbers_server::{Numbers, NumbersServer};
+use proto::{
     CreateStationReply, CreateStationRequest, ListStationsReply, ListStationsRequest, Station,
     StreamStationReply, StreamStationRequest,
 };
 
-pub mod numbers {
+pub mod proto {
     tonic::include_proto!("numbers.v1");
+
+    pub(crate) const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("numbers.v1");
 }
 
 #[derive(Debug, Clone)]
@@ -215,10 +217,16 @@ impl Numbers for NumbersService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let reflection_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .unwrap();
+
     let addr = "[::1]:50051".parse()?;
     let numbers_service = NumbersService::default();
 
     Server::builder()
+        .add_service(reflection_service)
         .add_service(NumbersServer::new(numbers_service))
         .serve(addr)
         .await?;
