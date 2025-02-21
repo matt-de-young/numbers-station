@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -29,6 +30,7 @@ struct StoredStation {
     station: Station,
     rng: Arc<Mutex<SmallRng>>,
     current_listeners: Arc<Mutex<u32>>,
+    last_active: Arc<Mutex<std::time::Instant>>,
 }
 
 pub struct NumbersService {
@@ -63,7 +65,11 @@ impl<S: Stream + Unpin> Stream for TrackedStream<S> {
 }
 
 impl NumbersService {
-    pub fn new(max_stations: usize) -> Self {
+    pub fn new(
+        max_stations: usize,
+        cleanup_interval: Duration,
+        inactive_threshold: Duration,
+    ) -> Self {
         let service = Self {
             stations: Arc::new(Mutex::new(HashMap::new())),
             number_broadcasts: Arc::new(Mutex::new(HashMap::new())),
@@ -112,6 +118,28 @@ impl NumbersService {
                             }
                         }
                     }
+                }
+            }
+        });
+
+        // Add cleanup loop
+        let stations_cleanup = Arc::clone(&service.stations);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(cleanup_interval).await;
+
+                if let Ok(mut stations_lock) = stations_cleanup.lock() {
+                    let now = std::time::Instant::now();
+                    stations_lock.retain(|_, station| {
+                        let keep = if let (Ok(listeners), Ok(last_active)) =
+                            (station.current_listeners.lock(), station.last_active.lock())
+                        {
+                            *listeners > 0 || now.duration_since(*last_active) < inactive_threshold
+                        } else {
+                            true // Keep station if we can't acquire locks
+                        };
+                        keep
+                    });
                 }
             }
         });
@@ -214,17 +242,18 @@ impl Numbers for NumbersService {
             current_listeners: 0, // Initialize with 0 listeners
         };
 
-        let internal_station = StoredStation {
+        let stored_station = StoredStation {
             station,
             rng: Arc::new(Mutex::new(rng)),
-            current_listeners: Arc::new(Mutex::new(0)), // Initialize the counter
+            current_listeners: Arc::new(Mutex::new(0)),
+            last_active: Arc::new(Mutex::new(std::time::Instant::now())), // Initialize last_active
         };
 
         let mut stations_lock = self
             .stations
             .lock()
             .map_err(|_| Status::internal("Lock error"))?;
-        stations_lock.insert(station_id, internal_station);
+        stations_lock.insert(station_id, stored_station);
 
         Ok(Response::new(CreateStationReply {
             station: Some(station),
@@ -237,7 +266,6 @@ impl Numbers for NumbersService {
     ) -> Result<Response<Self::StreamStationStream>, Status> {
         let station_id = request.into_inner().station_id;
 
-        // Verify station exists and get the station
         let stations_lock = self
             .stations
             .lock()
@@ -246,6 +274,11 @@ impl Numbers for NumbersService {
         let station = stations_lock
             .get(&station_id)
             .ok_or_else(|| Status::not_found("Station not found"))?;
+
+        // Update last_active timestamp
+        if let Ok(mut last_active) = station.last_active.lock() {
+            *last_active = std::time::Instant::now();
+        }
 
         // Increment listener count
         if let Ok(mut listeners) = station.current_listeners.lock() {
@@ -302,14 +335,26 @@ impl Numbers for NumbersService {
     }
 }
 
-const DEFAULT_MAX_STATIONS: usize = 100;
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_stations = std::env::var("MAX_STATIONS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_STATIONS);
+        .unwrap_or(100);
+
+    let cleanup_interval = tokio::time::Duration::from_secs(
+        std::env::var("CLEANUP_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60),
+    ); // 1 minute
+
+    let inactive_threshold = std::time::Duration::from_secs(
+        std::env::var("INACTIVE_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3600),
+    ); // 1 hour
 
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
@@ -322,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     let addr = "[::1]:50051".parse()?;
-    let numbers_service = NumbersService::new(max_stations); // Updated to use new constructor
+    let numbers_service = NumbersService::new(max_stations, cleanup_interval, inactive_threshold);
 
     Server::builder()
         .add_service(reflection_service)
