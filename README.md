@@ -5,7 +5,7 @@
 - [ ] Logging
 - [ ] Add a "current listeners" count to the station info
 - [ ] Automatically close stations after 1 hour of no listeners
-- [ ] Limit number of active stations
+- [x] Limit number of active stations
 - [ ] Use Buf to manage protobuf
 - [ ] Unit Tests
 - [ ] Containerize

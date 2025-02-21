@@ -29,13 +29,15 @@ pub struct NumbersService {
     number_broadcasts: Arc<
         Mutex<HashMap<i32, Vec<tokio::sync::mpsc::Sender<Result<StreamStationReply, Status>>>>>,
     >,
+    max_stations: usize,
 }
 
-impl Default for NumbersService {
-    fn default() -> Self {
+impl NumbersService {
+    pub fn new(max_stations: usize) -> Self {
         let service = Self {
             stations: Arc::new(Mutex::new(HashMap::new())),
             number_broadcasts: Arc::new(Mutex::new(HashMap::new())),
+            max_stations,
         };
 
         // Start the broadcast loop
@@ -86,10 +88,7 @@ impl Default for NumbersService {
 
         service
     }
-}
 
-impl NumbersService {
-    // Helper function to generate a unique random station ID
     fn generate_unique_station_id(&self) -> Result<i32, Status> {
         let stations_lock = self
             .stations
@@ -132,6 +131,18 @@ impl Numbers for NumbersService {
         request: Request<CreateStationRequest>,
     ) -> Result<Response<CreateStationReply>, Status> {
         let req = request.into_inner();
+
+        // Check if we've reached the station limit
+        let stations_lock = self
+            .stations
+            .lock()
+            .map_err(|_| Status::internal("Lock error"))?;
+        if stations_lock.len() >= self.max_stations {
+            return Err(Status::resource_exhausted(
+                "Maximum number of stations reached",
+            ));
+        }
+        drop(stations_lock); // Release the lock before continuing
 
         let seed = if let Some(seed_str) = req.seed {
             seed_str
@@ -215,8 +226,15 @@ impl Numbers for NumbersService {
     type StreamStationStream = ReceiverStream<Result<StreamStationReply, Status>>;
 }
 
+const DEFAULT_MAX_STATIONS: usize = 100;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let max_stations = std::env::var("MAX_STATIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_STATIONS);
+
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
         .build_v1()
@@ -228,7 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     let addr = "[::1]:50051".parse()?;
-    let numbers_service = NumbersService::default();
+    let numbers_service = NumbersService::new(max_stations); // Updated to use new constructor
 
     Server::builder()
         .add_service(reflection_service)
