@@ -1,13 +1,16 @@
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 use prost_types::Timestamp;
-use tonic::{transport::Server, Request, Response, Status};
-use tokio_stream::wrappers::ReceiverStream;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{transport::Server, Request, Response, Status};
 
 use numbers::numbers_server::{Numbers, NumbersServer};
-use numbers::{CreateStationReply, CreateStationRequest, ListStationsReply, ListStationsRequest, Station, StreamStationReply, StreamStationRequest};
+use numbers::{
+    CreateStationReply, CreateStationRequest, ListStationsReply, ListStationsRequest, Station,
+    StreamStationReply, StreamStationRequest,
+};
 
 pub mod numbers {
     tonic::include_proto!("numbers.v1");
@@ -21,7 +24,9 @@ struct StoredStation {
 
 pub struct NumbersService {
     stations: Arc<Mutex<HashMap<i32, StoredStation>>>,
-    number_broadcasts: Arc<Mutex<HashMap<i32, Vec<tokio::sync::mpsc::Sender<Result<StreamStationReply, Status>>>>>>,
+    number_broadcasts: Arc<
+        Mutex<HashMap<i32, Vec<tokio::sync::mpsc::Sender<Result<StreamStationReply, Status>>>>>,
+    >,
 }
 
 impl Default for NumbersService {
@@ -39,7 +44,7 @@ impl Default for NumbersService {
                 // Sleep until the next second
                 let now = tokio::time::Instant::now();
                 let next_second = std::time::Duration::from_nanos(
-                    1_000_000_000 - (now.elapsed().as_nanos() as u64 % 1_000_000_000) as u64
+                    1_000_000_000 - (now.elapsed().as_nanos() as u64 % 1_000_000_000),
                 );
                 tokio::time::sleep(next_second).await;
 
@@ -84,7 +89,10 @@ impl Default for NumbersService {
 impl NumbersService {
     // Helper function to generate a unique random station ID
     fn generate_unique_station_id(&self) -> Result<i32, Status> {
-        let stations_lock = self.stations.lock().map_err(|_| Status::internal("Lock error"))?;
+        let stations_lock = self
+            .stations
+            .lock()
+            .map_err(|_| Status::internal("Lock error"))?;
 
         for _ in 0..10 {
             // Generate random u16 and cast to i32 - will always be positive and ≤ 65535
@@ -104,11 +112,14 @@ impl Numbers for NumbersService {
         &self,
         _request: Request<ListStationsRequest>,
     ) -> Result<Response<ListStationsReply>, Status> {
-        let stations_lock = self.stations.lock().map_err(|_| Status::internal("Lock error"))?;
+        let stations_lock = self
+            .stations
+            .lock()
+            .map_err(|_| Status::internal("Lock error"))?;
 
         let stations: Vec<Station> = stations_lock
             .values()
-            .map(|internal| internal.station.clone())
+            .map(|internal| internal.station)
             .collect();
 
         Ok(Response::new(ListStationsReply { stations }))
@@ -121,7 +132,9 @@ impl Numbers for NumbersService {
         let req = request.into_inner();
 
         let seed = if let Some(seed_str) = req.seed {
-            seed_str.parse::<i32>().map_err(|_| Status::invalid_argument("Invalid seed value"))?
+            seed_str
+                .parse::<i32>()
+                .map_err(|_| Status::invalid_argument("Invalid seed value"))?
         } else {
             rand::random::<u8>() as i32
         };
@@ -130,7 +143,8 @@ impl Numbers for NumbersService {
         let station_id = self.generate_unique_station_id()?;
 
         let now = std::time::SystemTime::now();
-        let since_epoch = now.duration_since(std::time::UNIX_EPOCH)
+        let since_epoch = now
+            .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| Status::internal("Time conversion error"))?;
 
         let timestamp = Timestamp {
@@ -149,11 +163,14 @@ impl Numbers for NumbersService {
         };
 
         let internal_station = StoredStation {
-            station: station.clone(),
+            station,
             rng: Arc::new(Mutex::new(rng)),
         };
 
-        let mut stations_lock = self.stations.lock().map_err(|_| Status::internal("Lock error"))?;
+        let mut stations_lock = self
+            .stations
+            .lock()
+            .map_err(|_| Status::internal("Lock error"))?;
         stations_lock.insert(station_id, internal_station);
 
         Ok(Response::new(CreateStationReply {
@@ -168,7 +185,10 @@ impl Numbers for NumbersService {
         let station_id = request.into_inner().station_id;
 
         // Verify station exists
-        let stations_lock = self.stations.lock().map_err(|_| Status::internal("Lock error"))?;
+        let stations_lock = self
+            .stations
+            .lock()
+            .map_err(|_| Status::internal("Lock error"))?;
         if !stations_lock.contains_key(&station_id) {
             return Err(Status::not_found("Station not found"));
         }
@@ -178,8 +198,12 @@ impl Numbers for NumbersService {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
 
         // Add to broadcast list
-        let mut broadcasts_lock = self.number_broadcasts.lock().map_err(|_| Status::internal("Lock error"))?;
-        broadcasts_lock.entry(station_id)
+        let mut broadcasts_lock = self
+            .number_broadcasts
+            .lock()
+            .map_err(|_| Status::internal("Lock error"))?;
+        broadcasts_lock
+            .entry(station_id)
             .or_insert_with(Vec::new)
             .push(tx);
 
