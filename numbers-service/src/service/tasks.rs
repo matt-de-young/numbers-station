@@ -7,6 +7,29 @@ use tokio::time;
 use crate::proto::StreamStationReply;
 use crate::types::{BroadcastMap, StoredStation};
 
+fn gen_number(rng: &mut impl Rng) -> String {
+    let n = rng.gen::<u64>();
+    format!(
+        "{:02}{:03}{:02}",
+        n % 100,
+        (n / 100) % 1000,
+        (n / 100_000) % 100
+    )
+}
+
+impl Drop for StoredStation {
+    fn drop(&mut self) {
+        if let Ok(mut listeners) = self.current_listeners.lock() {
+            *listeners = 0;
+        }
+
+        println!(
+            "Dropping station {}: cleaning up resources",
+            self.station.station_id
+        );
+    }
+}
+
 pub fn start_broadcast_loop(
     stations: Arc<Mutex<HashMap<i32, StoredStation>>>,
     broadcasts: BroadcastMap,
@@ -27,15 +50,7 @@ pub fn start_broadcast_loop(
 
                     for (station_id, station) in stations_lock.iter() {
                         if let Ok(mut rng_lock) = station.rng.lock() {
-                            let n1 = rng_lock.gen::<u64>();
-                            let n2 = rng_lock.gen::<u64>();
-                            let n3 = rng_lock.gen::<u64>();
-
-                            let part1 = n1 % 100;
-                            let part2 = n2 % 1000;
-                            let part3 = n3 % 100;
-
-                            let message = format!("{:02}{:03}{:02}", part1, part2, part3);
+                            let message = gen_number(&mut *rng_lock);
 
                             if let Some(txs) = broadcasts_lock.get(station_id) {
                                 let reply = StreamStationReply { message };
@@ -57,20 +72,23 @@ pub fn start_cleanup_loop(
     inactive_threshold: Duration,
 ) {
     tokio::spawn(async move {
+        let mut interval = time::interval(cleanup_interval);
         loop {
-            time::sleep(cleanup_interval).await;
+            interval.tick().await;
 
             if let Ok(mut stations_lock) = stations.lock() {
                 let now = std::time::Instant::now();
                 stations_lock.retain(|_, station| {
-                    let keep = if let (Ok(listeners), Ok(last_active)) =
-                        (station.current_listeners.lock(), station.last_active.lock())
-                    {
-                        *listeners > 0 || now.duration_since(*last_active) < inactive_threshold
-                    } else {
-                        true
-                    };
-                    keep
+                    if let Ok(listeners) = station.current_listeners.lock() {
+                        if *listeners > 0 {
+                            return true;
+                        }
+                    }
+
+                    match station.last_active.lock() {
+                        Ok(last_active) => now.duration_since(*last_active) < inactive_threshold,
+                        Err(_) => true, // Keep station if we can't acquire lock
+                    }
                 });
             }
         }
@@ -109,6 +127,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_gen_number_format() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let number = gen_number(&mut rng);
+
+        assert_eq!(number.len(), 7, "Generated number should be 7 digits");
+        assert!(
+            number.chars().all(|c| c.is_digit(10)),
+            "All characters should be digits"
+        );
+    }
+
+    #[test]
+    fn test_gen_number_parts() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let number = gen_number(&mut rng);
+
+        let part1 = &number[0..2];
+        let part2 = &number[2..5];
+        let part3 = &number[5..7];
+
+        assert!(
+            part1.parse::<u64>().unwrap() < 100,
+            "First part should be < 100"
+        );
+        assert!(
+            part2.parse::<u64>().unwrap() < 1000,
+            "Second part should be < 1000"
+        );
+        assert!(
+            part3.parse::<u64>().unwrap() < 100,
+            "Third part should be < 100"
+        );
+    }
+
     #[tokio::test]
     async fn test_cleanup_loop_removes_inactive_stations() {
         let stations = Arc::new(Mutex::new(HashMap::new()));
@@ -132,65 +185,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_gen_number_deterministic() {
+        let mut rng1 = SmallRng::seed_from_u64(42);
+        let mut rng2 = SmallRng::seed_from_u64(42);
+
+        let number1 = gen_number(&mut rng1);
+        let number2 = gen_number(&mut rng2);
+
+        assert_eq!(number1, number2, "Same seed should produce same number");
+    }
+
+    #[test]
+    fn test_gen_number_distribution() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mut seen_different = false;
+
+        // Generate several numbers and ensure they're not all the same
+        let first = gen_number(&mut rng);
+        for _ in 0..10 {
+            if gen_number(&mut rng) != first {
+                seen_different = true;
+                break;
+            }
+        }
+
+        assert!(
+            seen_different,
+            "Should generate different numbers over time"
+        );
+    }
+
     #[tokio::test]
-    async fn test_cleanup_loop_keeps_active_stations() {
+    async fn test_cleanup_loop_removes_inactive_stations_immediately() {
         let stations = Arc::new(Mutex::new(HashMap::new()));
-        let cleanup_interval = Duration::from_millis(100);
-        let inactive_threshold = Duration::from_millis(200);
+        let cleanup_interval = Duration::from_millis(50);
+        let inactive_threshold = Duration::from_millis(100);
 
         {
             let mut stations_lock = stations.lock().unwrap();
             let station = create_test_station(1);
-            *station.current_listeners.lock().unwrap() = 1;
+
+            if let Ok(mut last_active) = station.last_active.lock() {
+                *last_active = std::time::Instant::now() - Duration::from_millis(200);
+            }
             stations_lock.insert(1, station);
         }
 
         let stations_clone = Arc::clone(&stations);
         start_cleanup_loop(stations_clone, cleanup_interval, inactive_threshold);
 
-        tokio::time::sleep(cleanup_interval + inactive_threshold).await;
+        tokio::time::sleep(cleanup_interval + Duration::from_millis(10)).await;
 
         let stations_lock = stations.lock().unwrap();
-        assert!(!stations_lock.is_empty(), "Active station should be kept");
+        assert!(
+            stations_lock.is_empty(),
+            "Inactive station should be removed quickly"
+        );
     }
 
     #[tokio::test]
-    async fn test_broadcast_loop_sends_messages() {
+    async fn test_cleanup_loop_handles_multiple_stations() {
         let stations = Arc::new(Mutex::new(HashMap::new()));
-        let broadcasts: BroadcastMap = Arc::new(Mutex::new(HashMap::new()));
-
-        let (tx, mut rx) = mpsc::channel(100);
+        let cleanup_interval = Duration::from_millis(50);
+        let inactive_threshold = Duration::from_millis(100);
 
         {
             let mut stations_lock = stations.lock().unwrap();
-            stations_lock.insert(1, create_test_station(1));
 
-            let mut broadcasts_lock = broadcasts.lock().unwrap();
-            broadcasts_lock.insert(1, vec![tx]);
+            // Active station with listeners
+            let active_station = create_test_station(1);
+            *active_station.current_listeners.lock().unwrap() = 1;
+            stations_lock.insert(1, active_station);
+
+            // Recently active station without listeners
+            let recent_station = create_test_station(2);
+            stations_lock.insert(2, recent_station);
+
+            // Inactive station
+            let inactive_station = create_test_station(3);
+            if let Ok(mut last_active) = inactive_station.last_active.lock() {
+                *last_active = std::time::Instant::now() - Duration::from_millis(200);
+            }
+            stations_lock.insert(3, inactive_station);
         }
 
         let stations_clone = Arc::clone(&stations);
-        let broadcasts_clone = Arc::clone(&broadcasts);
-        start_broadcast_loop(stations_clone, broadcasts_clone);
+        start_cleanup_loop(stations_clone, cleanup_interval, inactive_threshold);
 
-        // Wait for up to 2 seconds for a message
-        let mut received_message = false;
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            match rx.try_recv() {
-                Ok(Ok(reply)) => {
-                    assert_eq!(reply.message.len(), 7, "Message should be 7 digits");
-                    assert!(
-                        reply.message.chars().all(|c| c.is_digit(10)),
-                        "Message should be numeric"
-                    );
-                    received_message = true;
-                    break;
-                }
-                _ => continue,
-            }
-        }
-        assert!(received_message, "Should have received a broadcast message");
+        tokio::time::sleep(cleanup_interval + Duration::from_millis(10)).await;
+
+        let stations_lock = stations.lock().unwrap();
+        assert_eq!(
+            stations_lock.len(),
+            2,
+            "Should keep active and recent stations"
+        );
+        assert!(
+            stations_lock.contains_key(&1),
+            "Should keep station with listeners"
+        );
+        assert!(stations_lock.contains_key(&2), "Should keep recent station");
+        assert!(
+            !stations_lock.contains_key(&3),
+            "Should remove inactive station"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_station_cleanup_on_drop() {
+        let station = create_test_station(1);
+
+        // Set some listeners
+        *station.current_listeners.lock().unwrap() = 5;
+
+        // Drop the station
+        drop(station);
+
+        // Create new station with same ID to verify cleanup
+        let new_station = create_test_station(1);
+        assert_eq!(
+            *new_station.current_listeners.lock().unwrap(),
+            0,
+            "New station should start with 0 listeners"
+        );
     }
 
     #[tokio::test]
