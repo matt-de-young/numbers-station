@@ -1,6 +1,6 @@
-mod broadcaster;
 mod handlers;
 mod stream;
+mod tasks;
 
 use futures::Stream;
 use rand::random;
@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tonic::{Request, Response, Status};
 
-use self::broadcaster::{start_broadcast_loop, start_cleanup_loop};
+use self::tasks::{start_broadcast_loop, start_cleanup_loop};
 use crate::proto::numbers::numbers_server::Numbers;
 use crate::proto::numbers::{
     CreateStationReply, CreateStationRequest, ListStationsReply, ListStationsRequest,
@@ -36,13 +36,11 @@ impl NumbersService {
             max_stations,
         };
 
-        // Start the broadcast loop
         start_broadcast_loop(
             Arc::clone(&service.stations),
             Arc::clone(&service.number_broadcasts),
         );
 
-        // Start cleanup loop
         start_cleanup_loop(
             Arc::clone(&service.stations),
             cleanup_interval,
