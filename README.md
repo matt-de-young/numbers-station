@@ -11,7 +11,7 @@ Once created, a station will stream a new random number every second. Stations c
 - [x] Automatically close stations after 1 hour of no listeners
 - [x] Limit number of active stations
 - [ ] Use Buf to manage protobuf
-- [ ] Unit Tests
+- [x] Unit Tests
 - [ ] Containerize
 - [ ] Deploy
 - [ ] CD

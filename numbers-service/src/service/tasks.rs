@@ -201,7 +201,6 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
         let mut seen_different = false;
 
-        // Generate several numbers and ensure they're not all the same
         let first = gen_number(&mut rng);
         for _ in 0..10 {
             if gen_number(&mut rng) != first {
@@ -253,16 +252,13 @@ mod tests {
         {
             let mut stations_lock = stations.lock().unwrap();
 
-            // Active station with listeners
             let active_station = create_test_station(1);
             *active_station.current_listeners.lock().unwrap() = 1;
             stations_lock.insert(1, active_station);
 
-            // Recently active station without listeners
             let recent_station = create_test_station(2);
             stations_lock.insert(2, recent_station);
 
-            // Inactive station
             let inactive_station = create_test_station(3);
             if let Ok(mut last_active) = inactive_station.last_active.lock() {
                 *last_active = std::time::Instant::now() - Duration::from_millis(200);
@@ -295,14 +291,10 @@ mod tests {
     #[tokio::test]
     async fn test_station_cleanup_on_drop() {
         let station = create_test_station(1);
-
-        // Set some listeners
         *station.current_listeners.lock().unwrap() = 5;
 
-        // Drop the station
         drop(station);
 
-        // Create new station with same ID to verify cleanup
         let new_station = create_test_station(1);
         assert_eq!(
             *new_station.current_listeners.lock().unwrap(),
