@@ -134,7 +134,7 @@ mod tests {
 
         assert_eq!(number.len(), 7, "Generated number should be 7 digits");
         assert!(
-            number.chars().all(|c| c.is_digit(10)),
+            number.chars().all(|c| c.is_ascii_digit()),
             "All characters should be digits"
         );
     }
@@ -338,7 +338,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if let Ok(Ok(reply)) = rx.try_recv() {
                 assert_eq!(reply.message.len(), 7);
-                assert!(reply.message.chars().all(|c| c.is_digit(10)));
+                assert!(reply.message.chars().all(|c| c.is_ascii_digit()));
 
                 let part1 = &reply.message[0..2];
                 let part2 = &reply.message[2..5];

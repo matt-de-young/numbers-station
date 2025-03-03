@@ -125,10 +125,11 @@ mod tests {
     async fn test_listener_count_updates() {
         let service = setup_service_with_stations(vec![(1, 5)]);
 
-        let stations_lock = service.stations.lock().unwrap();
-        let station = stations_lock.get(&1).unwrap();
-        *station.current_listeners.lock().unwrap() = 7;
-        drop(stations_lock);
+        {
+            let stations_lock = service.stations.lock().unwrap();
+            let station = stations_lock.get(&1).unwrap();
+            *station.current_listeners.lock().unwrap() = 7;
+        }
 
         let request = Request::new(ListStationsRequest {});
         let response = service.handle_list_stations(request).await.unwrap();
@@ -156,10 +157,16 @@ mod tests {
         let service_clone = service.clone();
 
         let update_task = tokio::spawn(async move {
-            let stations_lock = service_clone.stations.lock().unwrap();
-            let station = stations_lock.get(&1).unwrap();
-            *station.current_listeners.lock().unwrap() = 10;
+            {
+                let stations_lock = service_clone.stations.lock().unwrap();
+                let station = stations_lock.get(&1).unwrap();
+                *station.current_listeners.lock().unwrap() = 10;
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
 
         let request = Request::new(ListStationsRequest {});
         let response = service.handle_list_stations(request).await.unwrap();
@@ -168,9 +175,6 @@ mod tests {
 
         let reply = response.into_inner();
         assert_eq!(reply.stations.len(), 1);
-        // Note: We can't assert the exact listener count here as it depends on timing
-        assert!(
-            reply.stations[0].current_listeners == 5 || reply.stations[0].current_listeners == 10
-        );
+        assert_eq!(reply.stations[0].current_listeners, 10);
     }
 }
