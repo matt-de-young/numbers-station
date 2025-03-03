@@ -3,30 +3,55 @@ mod service;
 mod types;
 
 use crate::proto::numbers::numbers_server::NumbersServer;
+use figment::{providers::Env, Figment};
+use serde::Deserialize;
 use service::NumbersService;
 use std::time::Duration;
 use tonic::transport::Server;
 
+#[derive(Debug, Deserialize)]
+struct Config {
+    #[serde(default = "default_max_stations")]
+    max_stations: usize,
+
+    #[serde(default = "default_cleanup_interval")]
+    cleanup_interval_secs: u64,
+
+    #[serde(default = "default_inactive_threshold")]
+    inactive_threshold_secs: u64,
+
+    #[serde(default = "default_address")]
+    address: String,
+}
+
+fn default_max_stations() -> usize {
+    100
+}
+fn default_cleanup_interval() -> u64 {
+    60
+}
+fn default_inactive_threshold() -> u64 {
+    3600
+}
+fn default_address() -> String {
+    "[::1]:50051".to_string()
+}
+
+impl Config {
+    fn cleanup_interval(&self) -> Duration {
+        Duration::from_secs(self.cleanup_interval_secs)
+    }
+
+    fn inactive_threshold(&self) -> Duration {
+        Duration::from_secs(self.inactive_threshold_secs)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let max_stations = std::env::var("MAX_STATIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-
-    let cleanup_interval = Duration::from_secs(
-        std::env::var("CLEANUP_INTERVAL")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60),
-    );
-
-    let inactive_threshold = Duration::from_secs(
-        std::env::var("INACTIVE_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3600),
-    );
+    let config: Config = Figment::new()
+        .join(Env::prefixed("NUMBERS_").split("_"))
+        .extract()?;
 
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
@@ -38,8 +63,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_serving::<NumbersServer<NumbersService>>()
         .await;
 
-    let addr = "[::1]:50051".parse()?;
-    let numbers_service = NumbersService::new(max_stations, cleanup_interval, inactive_threshold);
+    let addr = config.address.parse()?;
+    let numbers_service = NumbersService::new(
+        config.max_stations,
+        config.cleanup_interval(),
+        config.inactive_threshold(),
+    );
 
     Server::builder()
         .add_service(reflection_service)
